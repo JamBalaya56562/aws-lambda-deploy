@@ -105,5 +105,5 @@ outputs:
     description: 'The function version if a new version was published.'
 
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
