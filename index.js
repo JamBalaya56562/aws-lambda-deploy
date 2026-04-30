@@ -17,7 +17,7 @@ async function run() {
     }
 
     const {
-      functionName, codeArtifactsDir,
+      functionName, packageType, codeArtifactsDir, imageUri,
       ephemeralStorage, parsedMemorySize, timeout,
       role, codeSigningConfigArn, kmsKeyArn, sourceKmsKeyArn,
       vpcConfig, deadLetterConfig, tracingConfig,
@@ -63,13 +63,18 @@ async function run() {
       }
     }
 
-    // Creating zip file
-    core.info(`Packaging code artifacts from ${codeArtifactsDir}`);
-    let finalZipPath = await packageCodeArtifacts(codeArtifactsDir);
+    // Creating zip file (only for Zip package type)
+    let finalZipPath = null;
+    if (packageType === 'Zip') {
+      core.info(`Packaging code artifacts from ${codeArtifactsDir}`);
+      finalZipPath = await packageCodeArtifacts(codeArtifactsDir);
+    } else if (packageType === 'Image') {
+      core.info(`Using container image: ${imageUri}`);
+    }
 
     // Create function
     await createFunction(client, {
-      functionName, region, finalZipPath, dryRun, role,
+      functionName, packageType, region, finalZipPath, imageUri, dryRun, role,
       s3Bucket, s3Key, sourceKmsKeyArn, runtime, handler,
       functionDescription, parsedMemorySize, timeout,
       publish, architectures, ephemeralStorage,
@@ -87,22 +92,30 @@ async function run() {
     const configCommand = new GetFunctionConfigurationCommand({FunctionName: functionName});
     let currentConfig = await client.send(configCommand);
 
+    // Check if package type is being changed (not supported by AWS)
+    if (currentConfig.PackageType && currentConfig.PackageType !== packageType) {
+      core.setFailed(`Cannot change package type of existing Lambda function from ${currentConfig.PackageType} to ${packageType}`);
+      return;
+    }
+
     const configChanged = hasConfigurationChanged(currentConfig, {
       ...(role && { Role: role }),
-      ...(handler && { Handler: handler }),
+      // Only include handler, runtime, and layers for Zip package type
+      ...(packageType === 'Zip' && handler && { Handler: handler }),
       ...(functionDescription && { Description: functionDescription }),
       ...(parsedMemorySize && { MemorySize: parsedMemorySize }),
       ...(timeout && { Timeout: timeout }),
-      ...(runtime && { Runtime: runtime }),
+      ...(packageType === 'Zip' && runtime && { Runtime: runtime }),
       ...(kmsKeyArn && { KMSKeyArn: kmsKeyArn }),
       ...(ephemeralStorage && { EphemeralStorage: { Size: ephemeralStorage } }),
       ...(vpcConfig && { VpcConfig: parsedVpcConfig }),
       Environment: { Variables: parsedEnvironment },
       ...(deadLetterConfig && { DeadLetterConfig: parsedDeadLetterConfig }),
       ...(tracingConfig && { TracingConfig: parsedTracingConfig }),
-      ...(layers && { Layers: parsedLayers }),
+      ...(packageType === 'Zip' && layers && { Layers: parsedLayers }),
       ...(fileSystemConfigs && { FileSystemConfigs: parsedFileSystemConfigs }),
-      ...(imageConfig && { ImageConfig: parsedImageConfig }),
+      // Only include ImageConfig for Image package type
+      ...(packageType === 'Image' && imageConfig && { ImageConfig: parsedImageConfig }),
       ...(snapStart && { SnapStart: parsedSnapStart }),
       ...(loggingConfig && { LoggingConfig: parsedLoggingConfig }),
       ...(durableConfig && { DurableConfig: parsedDurableConfig })
@@ -117,29 +130,30 @@ async function run() {
       await updateFunctionConfiguration(client, {
         functionName,
         role,
-        handler,
+        // Only include handler, runtime, and layers for Zip package type
+        ...(packageType === 'Zip' && { handler }),
         functionDescription,
         parsedMemorySize,
         timeout,
-        runtime,
+        ...(packageType === 'Zip' && { runtime }),
         kmsKeyArn,
         ephemeralStorage,
         vpcConfig,
         parsedEnvironment,
         deadLetterConfig,
         tracingConfig,
-        layers,
+        ...(packageType === 'Zip' && { layers }),
         fileSystemConfigs,
-        imageConfig,
+        ...(packageType === 'Image' && { imageConfig }),
         snapStart,
         loggingConfig,
         durableConfig,
         parsedVpcConfig,
         parsedDeadLetterConfig,
         parsedTracingConfig,
-        parsedLayers,
+        ...(packageType === 'Zip' && { parsedLayers }),
         parsedFileSystemConfigs,
-        parsedImageConfig,
+        ...(packageType === 'Image' && { parsedImageConfig }),
         parsedSnapStart,
         parsedLoggingConfig,
         parsedDurableConfig
@@ -151,6 +165,8 @@ async function run() {
     // Update Function Code
     await updateFunctionCode(client, {
       functionName,
+      packageType,
+      imageUri,
       finalZipPath,
       useS3Method,
       s3Bucket,
@@ -296,7 +312,7 @@ async function checkFunctionExists(client, functionName) {
 // Helper functions for creating Lambda function
 async function createFunction(client, inputs, functionExists) {
   const {
-    functionName, region, finalZipPath, dryRun, role, s3Bucket, s3Key,
+    functionName, packageType, region, finalZipPath, imageUri, dryRun, role, s3Bucket, s3Key,
     sourceKmsKeyArn, runtime, handler, functionDescription, parsedMemorySize,
     timeout, publish, architectures, ephemeralStorage, revisionId,
     vpcConfig, parsedEnvironment, deadLetterConfig, tracingConfig,
@@ -321,11 +337,17 @@ async function createFunction(client, inputs, functionExists) {
     }
 
     try {
-      core.info('Creating Lambda function with deployment package');
+      core.info(`Creating Lambda function with ${packageType} package type`);
 
       let codeParameter;
 
-      if (s3Bucket) {
+      if (packageType === 'Image') {
+        // For container images, use ImageUri
+        core.info(`Using container image: ${imageUri}`);
+        codeParameter = {
+          ImageUri: imageUri
+        };
+      } else if (s3Bucket) {
         try {
           await uploadToS3(finalZipPath, s3Bucket, s3Key, region);
           core.info(`Successfully uploaded package to S3: s3://${s3Bucket}/${s3Key}`);
@@ -368,9 +390,11 @@ async function createFunction(client, inputs, functionExists) {
       const input = {
         FunctionName: functionName,
         Code: codeParameter,
-        ...(runtime && { Runtime: runtime }),
+        PackageType: packageType,
         ...(role && { Role: role }),
-        ...(handler && { Handler: handler }),
+        // Only include Runtime, Handler, and Layers for Zip package type
+        ...(packageType === 'Zip' && runtime && { Runtime: runtime }),
+        ...(packageType === 'Zip' && handler && { Handler: handler }),
         ...(functionDescription && { Description: functionDescription }),
         ...(parsedMemorySize && { MemorySize: parsedMemorySize }),
         ...(timeout && { Timeout: timeout }),
@@ -382,9 +406,10 @@ async function createFunction(client, inputs, functionExists) {
         Environment: { Variables: parsedEnvironment },
         ...(deadLetterConfig && { DeadLetterConfig: parsedDeadLetterConfig }),
         ...(tracingConfig && { TracingConfig: parsedTracingConfig }),
-        ...(layers && { Layers: parsedLayers }),
+        ...(packageType === 'Zip' && layers && { Layers: parsedLayers }),
         ...(fileSystemConfigs && { FileSystemConfigs: parsedFileSystemConfigs }),
-        ...(imageConfig && { ImageConfig: parsedImageConfig }),
+        // Only include ImageConfig for Image package type
+        ...(packageType === 'Image' && imageConfig && { ImageConfig: parsedImageConfig }),
         ...(snapStart && { SnapStart: parsedSnapStart }),
         ...(loggingConfig && { LoggingConfig: parsedLoggingConfig }),
         ...(tags && { Tags: parsedTags }),
@@ -573,25 +598,31 @@ async function waitForFunctionUpdated(client, functionName, waitForMinutes = 5) 
 // Helper function for updating Lambda function code
 async function updateFunctionCode(client, params) {
   const {
-    functionName, finalZipPath, useS3Method, s3Bucket, s3Key,
+    functionName, packageType, imageUri, finalZipPath, useS3Method, s3Bucket, s3Key,
     codeArtifactsDir, architectures, publish, revisionId,
     sourceKmsKeyArn, dryRun, region
   } = params;
 
-  core.info(`Updating function code for ${functionName} with ${finalZipPath}`);
+  core.info(`Updating function code for ${functionName}`);
 
   try {
     const commonCodeParams = {
       FunctionName: functionName,
       ...(architectures && { Architectures: Array.isArray(architectures) ? architectures : [architectures] }),
       ...(publish !== undefined && { Publish: publish }),
-      ...(revisionId && { RevisionId: revisionId }),
-      ...(sourceKmsKeyArn && { SourceKmsKeyArn: sourceKmsKeyArn })
+      ...(revisionId && { RevisionId: revisionId })
     };
 
     let codeInput;
 
-    if (useS3Method) {
+    if (packageType === 'Image') {
+      // For container images, use ImageUri
+      core.info(`Using container image: ${imageUri}`);
+      codeInput = {
+        ...commonCodeParams,
+        ImageUri: imageUri
+      };
+    } else if (useS3Method) {
       core.info(`Using S3 deployment method with bucket: ${s3Bucket}, key: ${s3Key}`);
 
       await uploadToS3(finalZipPath, s3Bucket, s3Key, region);
@@ -600,7 +631,8 @@ async function updateFunctionCode(client, params) {
       codeInput = {
         ...commonCodeParams,
         S3Bucket: s3Bucket,
-        S3Key: s3Key
+        S3Key: s3Key,
+        ...(sourceKmsKeyArn && { SourceKmsKeyArn: sourceKmsKeyArn })
       };
     } else {
       let zipFileContent;
@@ -625,7 +657,8 @@ async function updateFunctionCode(client, params) {
 
       codeInput = {
         ...commonCodeParams,
-        ZipFile: zipFileContent
+        ZipFile: zipFileContent,
+        ...(sourceKmsKeyArn && { SourceKmsKeyArn: sourceKmsKeyArn })
       };
 
       core.info(`Original buffer length: ${zipFileContent.length} bytes`);
