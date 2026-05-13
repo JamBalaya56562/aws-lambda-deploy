@@ -2,16 +2,38 @@ const core = require('@actions/core');
 const originalValidations = require('../validations');
 
 jest.mock('@actions/core');
+jest.mock('@aws-sdk/client-lambda', () => {
+  const original = jest.requireActual('@aws-sdk/client-lambda');
+  return {
+    ...original,
+    CreateFunctionCommand: jest.fn().mockImplementation((params) => ({
+      ...params,
+      type: 'CreateFunctionCommand'
+    })),
+    UpdateFunctionCodeCommand: jest.fn().mockImplementation((params) => ({
+      ...params,
+      type: 'UpdateFunctionCodeCommand'
+    })),
+    GetFunctionConfigurationCommand: jest.fn().mockImplementation((params) => ({
+      ...params,
+      type: 'GetFunctionConfigurationCommand'
+    })),
+    LambdaClient: jest.fn().mockImplementation(() => ({
+      send: jest.fn()
+    })),
+    waitUntilFunctionUpdated: jest.fn().mockResolvedValue({})
+  };
+});
 
 describe('Container Image Support Tests', () => {
   let originalEnv;
-  
+
   beforeEach(() => {
     jest.clearAllMocks();
     originalEnv = process.env;
     process.env = { ...originalEnv };
     process.env.GITHUB_SHA = 'abc123';
-    
+
     // Default mock implementations
     core.getInput.mockImplementation((name) => {
       const inputs = {
@@ -22,7 +44,7 @@ describe('Container Image Support Tests', () => {
       };
       return inputs[name] || '';
     });
-    
+
     core.getBooleanInput.mockReturnValue(false);
   });
 
@@ -94,12 +116,92 @@ describe('Container Image Support Tests', () => {
         };
         return inputs[name] || '';
       });
-      
+
       const result = originalValidations.validateAllInputs();
       expect(result.valid).toBe(true);
       expect(result.packageType).toBe('Zip');
     });
   });
 
+  describe('Image package type wiring through createFunction and updateFunctionCode', () => {
+    const { LambdaClient, CreateFunctionCommand, UpdateFunctionCodeCommand } = require('@aws-sdk/client-lambda');
+    const index = require('../index');
+
+    test('createFunction sends ImageUri and PackageType=Image, omits Runtime/Handler/Layers/ZipFile', async () => {
+      // Respond to both CreateFunctionCommand (the assertion target) and the
+      // GetFunctionConfigurationCommand polled by waitForFunctionActive.
+      const mockSend = jest.fn().mockImplementation((cmd) => {
+        if (cmd && cmd.type === 'GetFunctionConfigurationCommand') {
+          return Promise.resolve({ State: 'Active' });
+        }
+        return Promise.resolve({
+          FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:test-function',
+          Version: '1'
+        });
+      });
+      LambdaClient.mockImplementation(() => ({ send: mockSend }));
+
+      const client = new LambdaClient();
+      const inputs = {
+        functionName: 'test-function',
+        packageType: 'Image',
+        imageUri: '123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest',
+        region: 'us-east-1',
+        role: 'arn:aws:iam::123456789012:role/test-role',
+        runtime: 'nodejs20.x',     // must be ignored for Image
+        handler: 'index.handler',  // must be ignored for Image
+        layers: ['arn:aws:lambda:us-east-1:123:layer:l1:1'], // must be ignored for Image
+        parsedLayers: ['arn:aws:lambda:us-east-1:123:layer:l1:1'],
+        parsedEnvironment: {}
+      };
+
+      await index.createFunction(client, inputs, false);
+
+      const createCall = mockSend.mock.calls.find(
+        ([c]) => c && c.type === 'CreateFunctionCommand'
+      );
+      expect(createCall).toBeDefined();
+      const sentInput = createCall[0];
+      expect(sentInput.PackageType).toBe('Image');
+      expect(sentInput.Code).toEqual({
+        ImageUri: '123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest'
+      });
+      expect(sentInput.Code.ZipFile).toBeUndefined();
+      expect(sentInput.Runtime).toBeUndefined();
+      expect(sentInput.Handler).toBeUndefined();
+      expect(sentInput.Layers).toBeUndefined();
+    });
+
+    test('updateFunctionCode sends ImageUri instead of ZipFile when packageType=Image', async () => {
+      const mockSend = jest.fn().mockResolvedValue({
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:test-function',
+        Version: '2'
+      });
+      LambdaClient.mockImplementation(() => ({ send: mockSend }));
+
+      const client = new LambdaClient();
+      const params = {
+        functionName: 'test-function',
+        packageType: 'Image',
+        imageUri: '123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest',
+        finalZipPath: null,
+        useS3Method: false,
+        architectures: 'x86_64',
+        publish: false,
+        dryRun: false,
+        region: 'us-east-1'
+      };
+
+      await index.updateFunctionCode(client, params);
+
+      expect(mockSend).toHaveBeenCalledTimes(1);
+      const sentInput = mockSend.mock.calls[0][0];
+      expect(sentInput.type).toBe('UpdateFunctionCodeCommand');
+      expect(sentInput.ImageUri).toBe('123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest');
+      expect(sentInput.ZipFile).toBeUndefined();
+      expect(sentInput.S3Bucket).toBeUndefined();
+      expect(sentInput.S3Key).toBeUndefined();
+    });
+  });
 
 });
