@@ -123,10 +123,7 @@ describe('Container Image Support Tests', () => {
     });
   });
 
-  // Regression tests for issue #70: v1.1.1 broke Image package type by
-  // unconditionally calling packageCodeArtifacts and stripping packageType
-  // from createFunction / updateFunctionCode.
-  describe('Image package type wiring (regression for #70)', () => {
+  describe('Image package type wiring through createFunction and updateFunctionCode', () => {
     const { LambdaClient, CreateFunctionCommand, UpdateFunctionCodeCommand } = require('@aws-sdk/client-lambda');
     const index = require('../index');
 
